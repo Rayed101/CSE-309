@@ -26,4 +26,5 @@ dist-ssr
 # Backend
 backend/venv
 backend/finvo.db
+backend/serviceAccountKey.json
 .env

@@ -2,7 +2,7 @@
 
 In-house software for tracking cloud kitchen finances: delivery costs, platform commissions (Foodpanda, Pathao Food, Foodi), fixed costs, ingredient purchases, and order sources (apps vs social media).
 
-**Stack:** React (Vite) frontend + FastAPI backend + SQLite (Firebase-ready)
+**Stack:** React (Vite) frontend + FastAPI backend + Firebase Firestore (Firestore-ready)
 
 ## Quick Start (< 1 hour)
 
@@ -73,7 +73,6 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-The SQLite database (`finvo.db`) is created automatically on first run.
 
 ## Firebase / Firestore
 
