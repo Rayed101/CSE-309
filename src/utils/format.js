@@ -1,4 +1,3 @@
-export default Format;
 export function formatCurrency(amount) {
   const num = Number(amount) || 0;
   return `৳${num.toLocaleString("en-BD", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
