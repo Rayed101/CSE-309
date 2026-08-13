@@ -1,9 +1,3 @@
-import React from "react";
-
-const Format = () => {
-  return <div></div>;
-};
-
 export default Format;
 export function formatCurrency(amount) {
   const num = Number(amount) || 0;
