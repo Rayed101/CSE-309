@@ -16,6 +16,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# SQLite fallback helpers
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
 # Firebase Admin SDK
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -162,6 +167,7 @@ def health():
 
 
 # --- Generic collection helpers ---
+# Keep a mapping of collection/table names
 COLLECTIONS = {
     "delivery_costs": "delivery_costs",
     "commissions": "commissions",
@@ -170,31 +176,141 @@ COLLECTIONS = {
     "order_sources": "order_sources",
 }
 
+# SQLite DB path used for the fallback (quick demo without Firebase)
+SQLITE_DB_PATH = Path(__file__).parent / "finvo.db"
+USE_FIRESTORE = False
+
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_sqlite():
+    # Create tables mirroring the original schema
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS delivery_costs (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                delivery_fee REAL NOT NULL,
+                rider_tip REAL DEFAULT 0,
+                notes TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS commissions (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                order_amount REAL NOT NULL,
+                commission_rate REAL NOT NULL,
+                commission_amount REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS fixed_costs (
+                id TEXT PRIMARY KEY,
+                month TEXT NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                description TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS ingredients (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                unit TEXT NOT NULL,
+                unit_cost REAL NOT NULL,
+                total_cost REAL NOT NULL,
+                supplier TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS order_sources (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                source TEXT NOT NULL,
+                order_count INTEGER NOT NULL,
+                revenue REAL NOT NULL,
+                notes TEXT DEFAULT ''
+            );
+        """)
+
 
 def list_collection(coll_name: str) -> List[Dict]:
-    ensure_db()
-    col = db.collection(coll_name)
-    # Order by 'date' or 'month' when present; Firestore ordering requires the field to exist on docs.
-    try:
-        docs = col.order_by("date", direction=firestore.Query.DESCENDING).stream()
-    except Exception:
-        docs = col.stream()
-    return [doc_to_dict(d) for d in docs]
+    # Firestore path
+    if USE_FIRESTORE:
+        ensure_db()
+        col = db.collection(coll_name)
+        try:
+            docs = col.order_by("date", direction=firestore.Query.DESCENDING).stream()
+        except Exception:
+            docs = col.stream()
+        return [doc_to_dict(d) for d in docs]
+
+    # SQLite fallback
+    with get_db() as conn:
+        if coll_name == COLLECTIONS["fixed_costs"]:
+            rows = conn.execute("SELECT * FROM fixed_costs ORDER BY month DESC").fetchall()
+        else:
+            rows = conn.execute(f"SELECT * FROM {coll_name} ORDER BY date DESC").fetchall()
+        return [dict(r) for r in rows]
 
 
 def create_in_collection(coll_name: str, data: dict) -> dict:
-    ensure_db()
-    col = db.collection(coll_name)
-    doc_id = new_id()
-    payload = {**data}
-    # Set document id to our generated id for consistency with previous API
-    col.document(doc_id).set(payload)
-    return {"id": doc_id, **payload}
+    if USE_FIRESTORE:
+        ensure_db()
+        col = db.collection(coll_name)
+        doc_id = new_id()
+        payload = {**data}
+        col.document(doc_id).set(payload)
+        return {"id": doc_id, **payload}
+
+    # SQLite fallback: map fields per collection
+    rid = new_id()
+    with get_db() as conn:
+        if coll_name == COLLECTIONS["delivery_costs"]:
+            conn.execute(
+                "INSERT INTO delivery_costs VALUES (?,?,?,?,?,?)",
+                (rid, data.get("date"), data.get("order_id"), data.get("delivery_fee"), data.get("rider_tip", 0), data.get("notes", "")),
+            )
+        elif coll_name == COLLECTIONS["commissions"]:
+            conn.execute(
+                "INSERT INTO commissions VALUES (?,?,?,?,?,?,?)",
+                (rid, data.get("date"), data.get("platform"), data.get("order_id"), data.get("order_amount"), data.get("commission_rate"), data.get("commission_amount")),
+            )
+        elif coll_name == COLLECTIONS["fixed_costs"]:
+            conn.execute(
+                "INSERT INTO fixed_costs VALUES (?,?,?,?,?)",
+                (rid, data.get("month"), data.get("type"), data.get("amount"), data.get("description", "")),
+            )
+        elif coll_name == COLLECTIONS["ingredients"]:
+            conn.execute(
+                "INSERT INTO ingredients VALUES (?,?,?,?,?,?,?,?)",
+                (rid, data.get("date"), data.get("item_name"), data.get("quantity"), data.get("unit"), data.get("unit_cost"), data.get("total_cost"), data.get("supplier", "")),
+            )
+        elif coll_name == COLLECTIONS["order_sources"]:
+            conn.execute(
+                "INSERT INTO order_sources VALUES (?,?,?,?,?,?)",
+                (rid, data.get("date"), data.get("source"), data.get("order_count"), data.get("revenue"), data.get("notes", "")),
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Unknown collection")
+    return {"id": rid, **data}
 
 
 def delete_from_collection(coll_name: str, doc_id: str) -> dict:
-    ensure_db()
-    db.collection(coll_name).document(doc_id).delete()
+    if USE_FIRESTORE:
+        ensure_db()
+        db.collection(coll_name).document(doc_id).delete()
+        return {"ok": True}
+
+    with get_db() as conn:
+        conn.execute(f"DELETE FROM {coll_name} WHERE id=?", (doc_id,))
     return {"ok": True}
 
 
@@ -233,14 +349,7 @@ def delete_commission(item_id: str):
 # --- Fixed Costs ---
 @app.get("/api/fixed-costs")
 def list_fixed_costs():
-    # Fixed costs use 'month' as primary sort
-    ensure_db()
-    col = db.collection(COLLECTIONS["fixed_costs"])
-    try:
-        docs = col.order_by("month", direction=firestore.Query.DESCENDING).stream()
-    except Exception:
-        docs = col.stream()
-    return [doc_to_dict(d) for d in docs]
+    return list_collection(COLLECTIONS["fixed_costs"])
 
 
 @app.post("/api/fixed-costs")
