@@ -1,18 +1,78 @@
-"""Finvo Cloud Kitchen API — FastAPI backend with SQLite (Firebase-ready)."""
+"""Finvo Cloud Kitchen API — FastAPI backend using Firebase Firestore.
 
-import sqlite3
+This replaces the previous SQLite implementation with Firestore while keeping the
+same API contract so the frontend requires no changes. To use Firestore you must
+provide Firebase service account credentials; see backend/.env.example for
+examples and the comments below inside this file.
+"""
+
+import os
+import json
 import uuid
-from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-DB_PATH = Path(__file__).parent / "finvo.db"
+# Firebase Admin SDK
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-app = FastAPI(title="Finvo API", version="1.0.0")
+
+# --- Firebase initialization ---
+# The application will attempt to initialize Firebase on startup using one of:
+# 1) FIREBASE_SERVICE_ACCOUNT_PATH - path to the service account JSON file
+# 2) FIREBASE_SERVICE_ACCOUNT_JSON - raw JSON string of the service account
+#
+# Provide one of the above in your environment (for deploy hosts, use env vars).
+# The file backend/.env.example has examples.
+
+FIREBASE_SERVICE_ACCOUNT_PATH = os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH")
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+firebase_app = None
+db = None
+
+
+def init_firebase():
+    global firebase_app, db
+    if firebase_app is not None:
+        return
+
+    cred = None
+    if FIREBASE_SERVICE_ACCOUNT_PATH:
+        # Path to downloaded service account JSON (recommended)
+        if not os.path.exists(FIREBASE_SERVICE_ACCOUNT_PATH):
+            raise RuntimeError(f"FIREBASE_SERVICE_ACCOUNT_PATH set but file not found: {FIREBASE_SERVICE_ACCOUNT_PATH}")
+        cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_PATH)
+    elif FIREBASE_SERVICE_ACCOUNT_JSON:
+        # Raw JSON in env var (useful for platforms that only accept env vars)
+        try:
+            sa_dict = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+            cred = credentials.Certificate(sa_dict)
+        except Exception as exc:
+            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON is set but invalid JSON") from exc
+    else:
+        # No credentials provided; the admin SDK will try application default credentials.
+        # This may work on some managed platforms (e.g., GCP). If not, calls will fail.
+        cred = None
+
+    try:
+        if cred:
+            firebase_app = firebase_admin.initialize_app(cred)
+        else:
+            # Initialize with default credentials (may work on GCP environments)
+            firebase_app = firebase_admin.initialize_app()
+        db = firestore.client()
+    except Exception as exc:
+        # Surface helpful error at startup
+        raise RuntimeError(f"Failed to initialize Firebase Admin SDK: {exc}") from exc
+
+
+# --- FastAPI setup ---
+app = FastAPI(title="Finvo API (Firestore)", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,75 +83,24 @@ app.add_middleware(
 )
 
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+# --- Helpers ---
 
-
-def init_db():
-    with get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS delivery_costs (
-                id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                order_id TEXT NOT NULL,
-                delivery_fee REAL NOT NULL,
-                rider_tip REAL DEFAULT 0,
-                notes TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS commissions (
-                id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                order_id TEXT NOT NULL,
-                order_amount REAL NOT NULL,
-                commission_rate REAL NOT NULL,
-                commission_amount REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS fixed_costs (
-                id TEXT PRIMARY KEY,
-                month TEXT NOT NULL,
-                type TEXT NOT NULL,
-                amount REAL NOT NULL,
-                description TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS ingredients (
-                id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                item_name TEXT NOT NULL,
-                quantity REAL NOT NULL,
-                unit TEXT NOT NULL,
-                unit_cost REAL NOT NULL,
-                total_cost REAL NOT NULL,
-                supplier TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS order_sources (
-                id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                source TEXT NOT NULL,
-                order_count INTEGER NOT NULL,
-                revenue REAL NOT NULL,
-                notes TEXT DEFAULT ''
-            );
-        """)
-
-
-def row_to_dict(row):
-    return dict(row) if row else None
-
-
-def new_id():
+def new_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
-# --- Models ---
+def doc_to_dict(doc) -> Dict:
+    d = doc.to_dict() if hasattr(doc, "to_dict") else dict(doc)
+    d["id"] = doc.id if hasattr(doc, "id") else d.get("id")
+    return d
 
+
+def ensure_db():
+    if db is None:
+        raise HTTPException(status_code=503, detail="Backend datastore not initialized")
+
+
+# --- Models ---
 class DeliveryCostIn(BaseModel):
     date: str
     order_id: str
@@ -134,199 +143,206 @@ class OrderSourceIn(BaseModel):
     notes: str = ""
 
 
-# --- Health ---
-
+# --- Startup event ---
 @app.on_event("startup")
-def startup():
-    init_db()
+def startup_event():
+    # Initialize Firebase. If credentials are not configured, this will raise a helpful error.
+    try:
+        init_firebase()
+    except Exception as exc:
+        # It's helpful to fail loud during startup to avoid silent misconfiguration.
+        # In production you can choose to log instead of raising.
+        raise
 
 
+# --- Health ---
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
-# --- Delivery Costs ---
+# --- Generic collection helpers ---
+COLLECTIONS = {
+    "delivery_costs": "delivery_costs",
+    "commissions": "commissions",
+    "fixed_costs": "fixed_costs",
+    "ingredients": "ingredients",
+    "order_sources": "order_sources",
+}
 
+
+def list_collection(coll_name: str) -> List[Dict]:
+    ensure_db()
+    col = db.collection(coll_name)
+    # Order by 'date' or 'month' when present; Firestore ordering requires the field to exist on docs.
+    try:
+        docs = col.order_by("date", direction=firestore.Query.DESCENDING).stream()
+    except Exception:
+        docs = col.stream()
+    return [doc_to_dict(d) for d in docs]
+
+
+def create_in_collection(coll_name: str, data: dict) -> dict:
+    ensure_db()
+    col = db.collection(coll_name)
+    doc_id = new_id()
+    payload = {**data}
+    # Set document id to our generated id for consistency with previous API
+    col.document(doc_id).set(payload)
+    return {"id": doc_id, **payload}
+
+
+def delete_from_collection(coll_name: str, doc_id: str) -> dict:
+    ensure_db()
+    db.collection(coll_name).document(doc_id).delete()
+    return {"ok": True}
+
+
+# --- Delivery Costs ---
 @app.get("/api/delivery-costs")
 def list_delivery_costs():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM delivery_costs ORDER BY date DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
+    return list_collection(COLLECTIONS["delivery_costs"])
 
 
 @app.post("/api/delivery-costs")
 def create_delivery_cost(data: DeliveryCostIn):
-    rid = new_id()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO delivery_costs VALUES (?,?,?,?,?,?)",
-            (rid, data.date, data.order_id, data.delivery_fee, data.rider_tip, data.notes),
-        )
-    return {"id": rid, **data.model_dump()}
+    return create_in_collection(COLLECTIONS["delivery_costs"], data.model_dump())
 
 
 @app.delete("/api/delivery-costs/{item_id}")
 def delete_delivery_cost(item_id: str):
-    with get_db() as conn:
-        conn.execute("DELETE FROM delivery_costs WHERE id=?", (item_id,))
-    return {"ok": True}
+    return delete_from_collection(COLLECTIONS["delivery_costs"], item_id)
 
 
 # --- Commissions ---
-
 @app.get("/api/commissions")
 def list_commissions():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM commissions ORDER BY date DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
+    return list_collection(COLLECTIONS["commissions"])
 
 
 @app.post("/api/commissions")
 def create_commission(data: CommissionIn):
-    rid = new_id()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO commissions VALUES (?,?,?,?,?,?,?)",
-            (rid, data.date, data.platform, data.order_id, data.order_amount,
-             data.commission_rate, data.commission_amount),
-        )
-    return {"id": rid, **data.model_dump()}
+    return create_in_collection(COLLECTIONS["commissions"], data.model_dump())
 
 
 @app.delete("/api/commissions/{item_id}")
 def delete_commission(item_id: str):
-    with get_db() as conn:
-        conn.execute("DELETE FROM commissions WHERE id=?", (item_id,))
-    return {"ok": True}
+    return delete_from_collection(COLLECTIONS["commissions"], item_id)
 
 
 # --- Fixed Costs ---
-
 @app.get("/api/fixed-costs")
 def list_fixed_costs():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM fixed_costs ORDER BY month DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
+    # Fixed costs use 'month' as primary sort
+    ensure_db()
+    col = db.collection(COLLECTIONS["fixed_costs"])
+    try:
+        docs = col.order_by("month", direction=firestore.Query.DESCENDING).stream()
+    except Exception:
+        docs = col.stream()
+    return [doc_to_dict(d) for d in docs]
 
 
 @app.post("/api/fixed-costs")
 def create_fixed_cost(data: FixedCostIn):
-    rid = new_id()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO fixed_costs VALUES (?,?,?,?,?)",
-            (rid, data.month, data.type, data.amount, data.description),
-        )
-    return {"id": rid, **data.model_dump()}
+    return create_in_collection(COLLECTIONS["fixed_costs"], data.model_dump())
 
 
 @app.delete("/api/fixed-costs/{item_id}")
 def delete_fixed_cost(item_id: str):
-    with get_db() as conn:
-        conn.execute("DELETE FROM fixed_costs WHERE id=?", (item_id,))
-    return {"ok": True}
+    return delete_from_collection(COLLECTIONS["fixed_costs"], item_id)
 
 
 # --- Ingredients ---
-
 @app.get("/api/ingredients")
 def list_ingredients():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM ingredients ORDER BY date DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
+    return list_collection(COLLECTIONS["ingredients"])
 
 
 @app.post("/api/ingredients")
 def create_ingredient(data: IngredientIn):
-    rid = new_id()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO ingredients VALUES (?,?,?,?,?,?,?,?)",
-            (rid, data.date, data.item_name, data.quantity, data.unit,
-             data.unit_cost, data.total_cost, data.supplier),
-        )
-    return {"id": rid, **data.model_dump()}
+    return create_in_collection(COLLECTIONS["ingredients"], data.model_dump())
 
 
 @app.delete("/api/ingredients/{item_id}")
 def delete_ingredient(item_id: str):
-    with get_db() as conn:
-        conn.execute("DELETE FROM ingredients WHERE id=?", (item_id,))
-    return {"ok": True}
+    return delete_from_collection(COLLECTIONS["ingredients"], item_id)
 
 
 # --- Order Sources ---
-
 @app.get("/api/order-sources")
 def list_order_sources():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM order_sources ORDER BY date DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
+    return list_collection(COLLECTIONS["order_sources"])
 
 
 @app.post("/api/order-sources")
 def create_order_source(data: OrderSourceIn):
-    rid = new_id()
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO order_sources VALUES (?,?,?,?,?,?)",
-            (rid, data.date, data.source, data.order_count, data.revenue, data.notes),
-        )
-    return {"id": rid, **data.model_dump()}
+    return create_in_collection(COLLECTIONS["order_sources"], data.model_dump())
 
 
 @app.delete("/api/order-sources/{item_id}")
 def delete_order_source(item_id: str):
-    with get_db() as conn:
-        conn.execute("DELETE FROM order_sources WHERE id=?", (item_id,))
-    return {"ok": True}
+    return delete_from_collection(COLLECTIONS["order_sources"], item_id)
 
 
 # --- Dashboard ---
-
 @app.get("/api/dashboard/summary")
-def dashboard_summary(month: str | None = None):
+def dashboard_summary(month: Optional[str] = None):
+    """Return aggregated dashboard values for the specified month (YYYY-MM).
+
+    Implementation note: Firestore does not support aggregation queries like SQL SUM
+    easily across large datasets without collection group or aggregated counters.
+    For simplicity this function reads matching documents and aggregates in Python.
+    This is acceptable for small/medium datasets. For large scale, consider
+    Firestore aggregation queries or maintaining pre-aggregated counters.
+    """
+    ensure_db()
     if not month:
         month = datetime.now().strftime("%Y-%m")
 
-    with get_db() as conn:
-        delivery = conn.execute(
-            "SELECT COALESCE(SUM(delivery_fee + rider_tip), 0) FROM delivery_costs WHERE date LIKE ?",
-            (f"{month}%",),
-        ).fetchone()[0]
+    def sum_field(coll_name: str, field_name: str, by_date_field: str = "date") -> float:
+        total = 0.0
+        docs = db.collection(coll_name).stream()
+        for d in docs:
+            data = d.to_dict() or {}
+            dt = data.get(by_date_field, "")
+            if isinstance(dt, str) and dt.startswith(month):
+                val = data.get(field_name, 0) or 0
+                try:
+                    total += float(val)
+                except Exception:
+                    pass
+        return total
 
-        commission = conn.execute(
-            "SELECT COALESCE(SUM(commission_amount), 0) FROM commissions WHERE date LIKE ?",
-            (f"{month}%",),
-        ).fetchone()[0]
+    delivery = sum_field(COLLECTIONS["delivery_costs"], "delivery_fee") + sum_field(COLLECTIONS["delivery_costs"], "rider_tip")
+    commission = sum_field(COLLECTIONS["commissions"], "commission_amount")
+    fixed = 0.0
+    # fixed_costs store month directly
+    docs = db.collection(COLLECTIONS["fixed_costs"]).stream()
+    for d in docs:
+        data = d.to_dict() or {}
+        if data.get("month") == month:
+            try:
+                fixed += float(data.get("amount", 0) or 0)
+            except Exception:
+                pass
 
-        fixed = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM fixed_costs WHERE month = ?",
-            (month,),
-        ).fetchone()[0]
+    ingredients_total = sum_field(COLLECTIONS["ingredients"], "total_cost")
+    revenue = sum_field(COLLECTIONS["order_sources"], "revenue")
 
-        ingredients_total = conn.execute(
-            "SELECT COALESCE(SUM(total_cost), 0) FROM ingredients WHERE date LIKE ?",
-            (f"{month}%",),
-        ).fetchone()[0]
+    # orders by source and total orders
+    orders_by_source = {}
+    total_orders = 0
+    docs = db.collection(COLLECTIONS["order_sources"]).stream()
+    for d in docs:
+        data = d.to_dict() or {}
+        dt = data.get("date", "")
+        if isinstance(dt, str) and dt.startswith(month):
+            src = data.get("source", "unknown")
+            cnt = int(data.get("order_count", 0) or 0)
+            orders_by_source[src] = orders_by_source.get(src, 0) + cnt
+            total_orders += cnt
 
-        revenue = conn.execute(
-            "SELECT COALESCE(SUM(revenue), 0) FROM order_sources WHERE date LIKE ?",
-            (f"{month}%",),
-        ).fetchone()[0]
-
-        source_rows = conn.execute(
-            "SELECT source, SUM(order_count) as cnt FROM order_sources WHERE date LIKE ? GROUP BY source",
-            (f"{month}%",),
-        ).fetchall()
-
-        total_orders = conn.execute(
-            "SELECT COALESCE(SUM(order_count), 0) FROM order_sources WHERE date LIKE ?",
-            (f"{month}%",),
-        ).fetchone()[0]
-
-    orders_by_source = {r["source"]: r["cnt"] for r in source_rows}
     total_costs = delivery + commission + fixed + ingredients_total
 
     return {

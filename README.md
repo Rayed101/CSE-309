@@ -75,14 +75,22 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 
 The SQLite database (`finvo.db`) is created automatically on first run.
 
-## Firebase Migration
+## Firebase / Firestore
 
-The backend currently uses SQLite for zero-config setup. To switch to Firebase Firestore:
+This repository includes a Firestore-capable FastAPI backend (see `backend/main.py`). The backend will use the same API contract as the original SQLite implementation so the frontend requires no changes.
 
-1. Create a Firebase project and download a service account JSON
-2. Install `firebase-admin` in the backend
-3. Replace SQLite queries in `backend/main.py` with Firestore collection reads/writes
-4. The frontend API contract stays the same — no frontend changes needed
+To enable Firestore:
+
+1. Create a Firebase project and generate a service account JSON (IAM → Service Accounts → Create key).
+2. Provide credentials to the backend via one of these environment variables:
+   - `FIREBASE_SERVICE_ACCOUNT_PATH` — path to the downloaded JSON file (recommended)
+   - `FIREBASE_SERVICE_ACCOUNT_JSON` — full service account JSON as a string (useful on platforms that only accept env vars)
+   See `backend/.env.example` for examples and notes. The main backend code contains comments showing where to supply keys.
+3. Install backend requirements (includes `firebase-admin`) and start the backend.
+
+For small/medium projects the backend aggregates dashboard values in Python after reading documents. For large-scale usage, consider maintaining pre-aggregated counters or Firestore aggregation queries.
+
+Deployment files (Dockerfile, Procfile) were added under `backend/` to simplify deploys to Docker-friendly hosts or PaaS providers.
 
 ## API Endpoints
 
